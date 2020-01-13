@@ -12,6 +12,11 @@ import cropper
 import numpy as np
 import tqdm
 
+import torch
+from PIL import Image
+from torchvision import models
+import torchvision.transforms as T
+import numpy as np
 
 # ==============================================================================
 # =                                      param                                 =
@@ -34,6 +39,8 @@ parser.add_argument('--face_factor', dest='face_factor', type=float, help='The f
 parser.add_argument('--align_type', dest='align_type', choices=['affine', 'similarity'], default='similarity')
 parser.add_argument('--order', dest='order', type=int, choices=[0, 1, 2, 3, 4, 5], help='The order of interpolation.', default=3)
 parser.add_argument('--mode', dest='mode', choices=['constant', 'edge', 'symmetric', 'reflect', 'wrap'], default='edge')
+parser.add_argument('--remove_background', action='store_true', dest='remove_background', default='True')
+parser.add_argument('--cuda', default='True', action='store_true', help='enables cuda')
 args = parser.parse_args()
 
 
@@ -78,6 +85,22 @@ data_dir = os.path.join(save_dir, 'data')
 if not os.path.isdir(data_dir):
     os.makedirs(data_dir)
 
+# segmentation
+if args.remove_background:
+    assert args.crop_size_h == args.crop_size_w, "crop_size_h and args.crop_size_w should be equal"
+
+    fcn = models.segmentation.deeplabv3_resnet101(pretrained=True).eval()
+    if args.cuda:
+        fcn = fcn.cuda()
+    transform = T.Compose([T.ToTensor(), 
+                           T.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
+                          ])
+
+def decode_segmap(image, original, nc=21):
+    idx = (image != 0) * 1
+    idx  = np.stack([idx, idx, idx], axis=2)
+    rgb = original * idx
+    return rgb
 
 def work(i):  # a single work
     for _ in range(3):  # try three times
@@ -91,6 +114,14 @@ def work(i):  # a single work
                                                      align_type=args.align_type,
                                                      order=args.order,
                                                      mode=args.mode)
+
+            if args.remove_background:
+                inp = transform(img_crop).unsqueeze(0)
+                if args.cuda:
+                    inp = inp.cuda()
+                out = fcn(inp)['out']
+                om = torch.argmax(out.squeeze(), dim=0).detach().cpu().numpy()
+                img_crop = decode_segmap(om, img_crop)
 
             name = os.path.splitext(img_names[i])[0] + '.' + args.save_format
             path = os.path.join(data_dir, name)
@@ -109,14 +140,14 @@ def work(i):  # a single work
     else:
         print('%s fails!' % img_names[i])
 
+if __name__ == '__main__':
+    pool = Pool(args.n_worker)
+    name_landmark_strs = list(tqdm.tqdm(pool.imap(work, range(len(img_names))), total=len(img_names)))
+    pool.close()
+    pool.join()
 
-pool = Pool(args.n_worker)
-name_landmark_strs = list(tqdm.tqdm(pool.imap(work, range(len(img_names))), total=len(img_names)))
-pool.close()
-pool.join()
-
-landmarks_path = os.path.join(save_dir, 'landmark.txt')
-with open(landmarks_path, 'w') as f:
-    for name_landmark_str in name_landmark_strs:
-        if name_landmark_str:
-            f.write(name_landmark_str + '\n')
+    landmarks_path = os.path.join(save_dir, 'landmark.txt')
+    with open(landmarks_path, 'w') as f:
+        for name_landmark_str in name_landmark_strs:
+            if name_landmark_str:
+                f.write(name_landmark_str + '\n')
